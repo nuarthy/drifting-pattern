@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Drifting pattern</title>
+<style>
+  :root {
+    /* Base fill, and the colour the pattern is painted in. */
+    --bg: #dfdbe5;
+    /* Time for the pattern to travel one 40px tile diagonally. */
+    --drift-duration: 12s;
+  }
+
+  html,
+  body {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--bg);
+  }
+
+  #veil {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="veil" aria-hidden="true"></canvas>
+<script>
+  const canvas = document.getElementById('veil');
+  const ctx = canvas.getContext('2d');
+  const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  const TILE = 40;
+  const DRIFT_SECONDS = 12;
+  const hexToRgb = (hex) => {
+    const value = hex.trim().replace('#', '');
+    return [0, 2, 4].map((i) => parseInt(value.slice(i, i + 2), 16));
+  };
+  const BG = hexToRgb(
+    getComputedStyle(document.documentElement).getPropertyValue('--bg'),
+  );
+
+  // Same geometry as the original SVG tile: four corner chevrons plus the
+  // centred diamond, filled at 40% opacity.
+  const TILE_PATH = new Path2D(
+    'M0 38.59l2.83-2.83 1.41 1.41L1.41 40H0v-1.41zM0 1.4l2.83 2.83 1.41-1.41L1.41 0H0v1.41z' +
+      'M38.59 40l-2.83-2.83 1.41-1.41L40 38.59V40h-1.41zM40 1.41l-2.83 2.83-1.41-1.41L38.59 0H40v1.41z' +
+      'M20 18.6l2.83-2.83 1.41 1.41L21.41 20l2.83 2.83-1.41 1.41L20 21.41l-2.83 2.83-1.41-1.41L18.59 20' +
+      'l-2.83-2.83 1.41-1.41L20 18.59z',
+  );
+
+  let dpr = 1;
+  let pattern = null;
+
+  function makePattern() {
+    const tile = document.createElement('canvas');
+    tile.width = tile.height = TILE * dpr;
+    const t = tile.getContext('2d');
+    t.scale(dpr, dpr);
+    t.fillStyle = 'rgba(156, 146, 172, 0.55)';
+    t.fill(TILE_PATH, 'evenodd');
+    const p = ctx.createPattern(tile, 'repeat');
+    p.setTransform(new DOMMatrix([1 / dpr, 0, 0, 1 / dpr, 0, 0]));
+    return p;
+  }
+
+  // Soft-edged shape sprites. Each is a white silhouette on transparent, so
+  // only its alpha matters: it becomes the mask that reveals the pattern.
+  const SPRITE = 256;
+  const BLUR = 7;
+  // The copy keeps a much tighter edge: a faint fill only reads as a separate
+  // layer if its outline is crisp enough to see where the alpha steps down.
+  const GHOST_BLUR = 2;
+
+  const SHAPES = [
+    'circle',
+    'square',
+    'rectangle',
+    'pill',
+    'triangle',
+    'pentagon',
+    'hexagon',
+    'octagon',
+  ];
+
+  function traceShape(s, kind, r) {
+    s.beginPath();
+    switch (kind) {
+      case 'square':
+        s.rect(-r, -r, r * 2, r * 2);
+        break;
+      case 'rectangle':
+        s.rect(-r, -r * 0.6, r * 2, r * 1.2);
+        break;
+      case 'pill':
+        s.roundRect(-r, -r * 0.42, r * 2, r * 0.84, r * 0.42);
+        break;
+      case 'triangle':
+      case 'pentagon':
+      case 'hexagon':
+      case 'octagon': {
+        const sides = { triangle: 3, pentagon: 5, hexagon: 6, octagon: 8 }[kind];
+        const start = kind === 'hexagon' ? 0 : -Math.PI / 2;
+        for (let i = 0; i < sides; i += 1) {
+          const a = start + (i / sides) * Math.PI * 2;
+          const x = Math.cos(a) * r;
+          const y = Math.sin(a) * r;
+          if (i === 0) s.moveTo(x, y);
+          else s.lineTo(x, y);
+        }
+        s.closePath();
+        break;
+      }
+      default:
+        s.arc(0, 0, r, 0, Math.PI * 2);
+    }
+  }
+
+  function makeSprite(kind, ramped = true, blur = BLUR) {
+    const sprite = document.createElement('canvas');
+    sprite.width = sprite.height = SPRITE;
+    const s = sprite.getContext('2d');
+    s.translate(SPRITE / 2, SPRITE / 2);
+    s.fillStyle = '#fff';
+    // Blur softens the silhouette, so the pattern fades in across the rim
+    // instead of stopping at a hard polygon edge.
+    s.filter = `blur(${blur}px)`;
+
+    const R = SPRITE / 2 - BLUR * 2;
+    traceShape(s, kind, R);
+    s.fill();
+
+    // The silhouette on its own, at one flat alpha, is what the copy uses: a
+    // uniform half-strength shape reads as a separate layer, while a ramped
+    // copy would just blend into the window it sits behind.
+    if (!ramped) return sprite;
+
+    // Then cut a long radial falloff into that silhouette. Only the middle
+    // reaches full opacity; the rest declines steadily to nothing, so the
+    // pattern never sits at 100% across a whole shape.
+    s.filter = 'none';
+    s.globalCompositeOperation = 'destination-in';
+    const ramp = s.createRadialGradient(0, 0, 0, 0, 0, R + BLUR);
+    // Ends at a residual, not at zero: the vertices sit on the outermost ring,
+    // so a ramp that reached zero there would erase every corner and turn the
+    // polygons back into round blobs. The blurred silhouette handles the last
+    // step to zero.
+    ramp.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    ramp.addColorStop(0.2, 'rgba(255, 255, 255, 0.93)');
+    ramp.addColorStop(0.45, 'rgba(255, 255, 255, 0.82)');
+    ramp.addColorStop(0.7, 'rgba(255, 255, 255, 0.65)');
+    ramp.addColorStop(0.88, 'rgba(255, 255, 255, 0.56)');
+    ramp.addColorStop(1, 'rgba(255, 255, 255, 0.42)');
+    s.fillStyle = ramp;
+    s.beginPath();
+    s.arc(0, 0, R + BLUR, 0, Math.PI * 2);
+    s.fill();
+    return sprite;
+  }
+
+  const sprites = SHAPES.map((kind) => ({
+    kind,
+    sprite: makeSprite(kind),
+    flat: makeSprite(kind, false, GHOST_BLUR),
+  }));
+
+  let width = 0;
+  let height = 0;
+  let columns = 1;
+  const particles = [];
+
+  // Hard size limits. A window that reaches one holds that size and keeps
+  // drifting; it never reverses, and it never pops out mid-screen.
+  const MIN_RADIUS = 90;
+  const MAX_RADIUS = 260;
+
+  function seed(particle, initial, index = 0, total = 1) {
+    // Radius starts inside the limits: 90-260 px, square-skewed so most
+    // windows are mid-sized and a few are large.
+    particle.radius = MIN_RADIUS + Math.random() ** 2 * 170;
+
+    // Each window commits to one direction for its whole life: it only ever
+    // grows or only ever shrinks, at a steady proportional rate. The sign is
+    // redrawn on recycle, never mid-flight, so a window cannot pulse.
+    particle.growth =
+      (0.03 + Math.random() * 0.07) * (Math.random() < 0.5 ? -1 : 1);
+
+    if (initial) {
+      // Jittered grid, so the reveal windows start spread across the frame
+      // instead of clumping into one bright patch.
+      const rows = Math.max(1, Math.ceil(total / columns));
+      const col = index % columns;
+      const row = Math.floor(index / columns) % rows;
+      particle.x = ((col + 0.5 + (Math.random() - 0.5) * 0.7) / columns) * width;
+      particle.y = ((row + 0.5 + (Math.random() - 0.5) * 0.7) / rows) * height;
+    } else {
+      particle.x = Math.random() * width;
+      particle.y = height + particle.radius;
+    }
+
+    // Heading spans the upward half-plane: 0 rad is due right, PI is due left,
+    // PI/2 is straight up. The few degrees of margin keep every window
+    // climbing instead of sliding sideways along the top.
+    const heading = Math.PI * (0.03 + 0.94 * Math.random());
+    const speed = 8 + Math.random() * 22;
+    particle.vx = Math.cos(heading) * speed;
+    particle.vy = -Math.sin(heading) * speed;
+
+    particle.alpha = 0.85 + Math.random() * 0.15;
+    particle.phase = Math.random() * Math.PI * 2;
+    particle.sway = particle.radius * 0.06;
+    particle.swayRate = 0.1 + Math.random() * 0.3;
+
+    // A fresh silhouette and a fresh spin for every lifetime. Rotation is
+    // redrawn here too, so each window turns at its own rate and direction.
+    const shape = sprites[(Math.random() * sprites.length) | 0];
+    particle.kind = shape.kind;
+    particle.sprite = shape.sprite;
+    particle.ghost = shape.flat;
+    particle.rotation = Math.random() * Math.PI * 2;
+    particle.spin = (0.08 + Math.random() * 0.34) * (Math.random() < 0.5 ? -1 : 1);
+    // The copy is bigger and turned a little further, so its corners cross the
+    // window's outline instead of hiding underneath it.
+    particle.ghostScale = 1.25 + Math.random() * 0.3;
+    particle.ghostTurn = (Math.random() - 0.5) * 0.9;
+    particle.ghostOffset =
+      particle.radius * (0.35 + Math.random() * 0.3) * (Math.random() < 0.5 ? -1 : 1);
+    return particle;
+  }
+
+  function populate() {
+    // A few well-separated windows only, so the pattern shows in small
+    // islands and the plain background holds most of the frame.
+    const target = Math.round(
+      Math.min(8, Math.max(2, (width * height) / 250000)),
+    );
+    columns = Math.max(1, Math.ceil(Math.sqrt(target * (width / height))));
+    particles.length = 0;
+    for (let i = 0; i < target; i += 1) {
+      particles.push(seed({}, true, i, target));
+    }
+  }
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    width = window.innerWidth;
+    height = window.innerHeight;
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    pattern = makePattern();
+    populate();
+    if (reduceMotion) draw(0);
+  }
+
+  function stamp(p, scale = 1, alpha = p.alpha, offset = 0, sprite = p.sprite, turn = 0) {
+    const r = p.radius * scale;
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rotation + turn);
+    if (offset) ctx.translate(0, offset);
+    ctx.drawImage(sprite, -r, -r, r * 2, r * 2);
+    ctx.restore();
+  }
+
+  function draw(t) {
+    ctx.clearRect(0, 0, width, height);
+
+    // 1. Paint the reveal windows. Overlaps accumulate, so two windows meeting
+    //    brighten towards full pattern rather than cancelling out. Each window
+    //    carries a half-opacity copy offset behind it, which reads as depth.
+    for (const p of particles) {
+      stamp(p, p.ghostScale, p.alpha * 0.5, p.ghostOffset, p.ghost, p.ghostTurn);
+      stamp(p);
+    }
+    ctx.globalAlpha = 1;
+
+    // 2. Keep the pattern only where those windows are, at their alpha.
+    const drift = ((t % DRIFT_SECONDS) / DRIFT_SECONDS) * TILE;
+    ctx.globalCompositeOperation = 'source-in';
+    ctx.translate(drift, drift);
+    ctx.fillStyle = pattern;
+    ctx.fillRect(-TILE, -TILE, width + TILE * 2, height + TILE * 2);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  let last = 0;
+  function frame(now) {
+    const dt = last ? Math.min((now - last) / 1000, 0.05) : 0.016;
+    last = now;
+    const t = now / 1000;
+
+    for (const p of particles) {
+      p.x += (p.vx + Math.cos(t * p.swayRate + p.phase) * p.sway) * dt;
+      p.y += p.vy * dt;
+      p.radius *= 1 + p.growth * dt;
+      p.radius = Math.min(MAX_RADIUS, Math.max(MIN_RADIUS, p.radius));
+      p.rotation += p.spin * dt;
+
+      // Recycle only when the window has left the frame: over the top, or out
+      // past either side. Size never retires a window, so nothing vanishes
+      // while it is still on screen.
+      if (
+        p.y + p.radius < 0 ||
+        p.x < -p.radius * 2 ||
+        p.x > width + p.radius * 2
+      ) {
+        seed(p, false);
+      }
+    }
+
+    draw(t);
+    requestAnimationFrame(frame);
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+  if (!reduceMotion) requestAnimationFrame(frame);
+</script>
+</body>
+</html>
